@@ -1,6 +1,6 @@
 {
   "name": "magpie-agent-lingxi",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "WPS Lingxi (WPS 灵犀) on magpie's Agents page: magpie's models appear in Lingxi as magpie/<model>.",
   "type": "module",
   "main": "./main.js",
@@ -11,6 +11,7 @@
     "opencode.mjs",
     "lingxi.agent.js",
     "spawn-daemon.ps1",
+    "spawn-daemon.vbs",
     "launch-lingxi.ps1",
     "launch-lingxi.cmd",
     "icon.png",

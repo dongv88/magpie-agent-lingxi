@@ -12,6 +12,7 @@ const HEARTBEAT = join(DATA, "heartbeat")
 const LOCK = join(DATA, "daemon.lock")
 const DAEMON = join(HERE, "daemon.mjs")
 const SPAWN = join(HERE, "spawn-daemon.ps1")
+const LAUNCHER = join(HERE, "spawn-daemon.vbs")
 const LOG = join(DATA, "host.log")
 
 function note(line) {
@@ -30,20 +31,37 @@ function daemonAlive() {
   } catch { return false }
 }
 
-try { mkdirSync(DATA, { recursive: true }) } catch {}
-heartbeat()
-if (!daemonAlive()) {
-  // WMI creates the process outside this host's job object, so it survives the
-  // host being recycled.
-  const r = spawnSync("powershell.exe", [
+function sleep(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+}
+
+function spawnDaemon(extra) {
+  return spawnSync("powershell.exe", [
     "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
     "-File", SPAWN,
     "-Bun", process.execPath,
     "-Daemon", DAEMON,
     "-WorkDir", HERE,
     "-DataDir", DATA,
+    ...extra,
   ], { timeout: 15000, stdio: "ignore", windowsHide: true })
+}
+
+try { mkdirSync(DATA, { recursive: true }) } catch {}
+heartbeat()
+if (!daemonAlive()) {
+  // WMI creates the process outside this host's job object, so it survives the
+  // host being recycled. spawn-daemon.ps1 starts it through wscript, so no
+  // console window is created.
+  const r = spawnDaemon(["-Launcher", LAUNCHER])
   note(`spawn via wmi status=${r.status} err=${r.error ? r.error.message : ""}`)
+  // wscript returns at once; the daemon's lock file is what says it is up.
+  const until = Date.now() + 3000
+  while (Date.now() < until && !daemonAlive()) sleep(120)
+  if (!daemonAlive()) {
+    const r2 = spawnDaemon(["-NoLauncher"])
+    note(`launcher did not start it, direct spawn status=${r2.status}`)
+  }
 } else {
   note("daemon already running")
 }
