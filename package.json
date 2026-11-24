@@ -1,0 +1,49 @@
+{
+  "name": "magpie-agent-lingxi",
+  "version": "0.1.0",
+  "description": "WPS Lingxi (WPS 灵犀) on magpie's Agents page: magpie's models appear in Lingxi as magpie/<model>.",
+  "type": "module",
+  "main": "./main.js",
+  "exports": "./opencode.mjs",
+  "files": [
+    "main.js",
+    "daemon.mjs",
+    "opencode.mjs",
+    "lingxi.agent.js",
+    "spawn-daemon.ps1",
+    "launch-lingxi.ps1",
+    "launch-lingxi.cmd",
+    "icon.png",
+    "README.md",
+    "LICENSE"
+  ],
+  "os": [
+    "win32"
+  ],
+  "keywords": [
+    "magpie",
+    "magpie-plugin",
+    "magpie-agent",
+    "wps",
+    "lingxi",
+    "agent"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dongv88/magpie-agent-lingxi.git"
+  },
+  "homepage": "https://github.com/dongv88/magpie-agent-lingxi#readme",
+  "bugs": {
+    "url": "https://github.com/dongv88/magpie-agent-lingxi/issues"
+  },
+  "magpie": {
+    "agent": "./lingxi.agent.js",
+    "name": "WPS 灵犀",
+    "summary": {
+      "zh": "把 WPS 灵犀 接到 magpie：灵犀的模型菜单里出现 magpie/<模型>，走 magpie 的网关和路由。",
+      "en": "WPS Lingxi on magpie's Agents page: magpie's models appear in Lingxi as magpie/<model>."
+    },
+    "icon": "https://raw.githubusercontent.com/dongv88/magpie-agent-lingxi/main/icon.png"
+  }
+}
