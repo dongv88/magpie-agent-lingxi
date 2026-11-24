@@ -2,9 +2,12 @@
 // Lingxi keeps its model list in its own storage, not in a config file, so this
 // agent only carries the chosen model to ~/.config/magpie/lingxi.json; the
 // Bun side (main.js) reads it and syncs magpie's models into Lingxi over CDP.
+import { ICON } from "./icon-data.mjs"
+
 export const agent = {
   id: "lingxi",
   name: "WPS 灵犀",
+  icon: ICON,
   dir: "~/.config/magpie/lingxi-agent/installed",
   config: "~/.config/magpie/lingxi.json",
   format: "json",
