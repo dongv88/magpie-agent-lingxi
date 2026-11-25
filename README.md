@@ -43,15 +43,21 @@ magpie once: the plugin creates its detection marker on first run.
 1. In magpie: **Agent → WPS 灵犀 → switch it on, pick a model**.
 2. That is all. In 灵犀: **选择其他模型 → 自定义模型 → `magpie/<model>`**.
 
-On the first sync the plugin has to give 灵犀 the debug port, which can only be
-passed at startup, so 灵犀 is closed and reopened **once** at that moment (a
-WM_CLOSE, not a kill: a dialog or unsaved work is left alone and the sync waits).
-After that the list is in 灵犀's own storage and later syncs — a model picked
-again in magpie — cost another such restart only when the list actually changes.
+The debug port can only be passed when 灵犀 starts. The plugin therefore adds
+`--remote-debugging-port=9222` to the shortcuts that start 灵犀 (desktop, Start
+menu, taskbar, startup folder and the Run key), so a normal start opens the port
+and nothing else is needed. A start entry it cannot write (the public desktop
+shortcut needs admin rights) leaves 灵犀 without the port; the plugin then closes
+and reopens it **once** at that moment — WM_CLOSE first, and `taskkill` when the
+tray keeps it open (灵犀 restores the conversation). After the sync the list is
+in 灵犀's own storage, and picking a model in magpie again only rewrites it,
+with no restart while 灵犀 already runs with the port.
 
-`launch-lingxi.cmd` is still there for starting 灵犀 with the port yourself, and
-`LINGXI_NO_RESTART=1` turns the restart off: 灵犀 is then left alone and the
-models are synced the next time it happens to run with the port.
+`launch-lingxi.cmd` still starts 灵犀 with the port by hand.
+`LINGXI_NO_RESTART=1` turns the restart off, `LINGXI_NO_FORCE_RESTART=1` only
+keeps it from ending a tray 灵犀 that ignores WM_CLOSE, and
+`LINGXI_NO_SHORTCUT=1` leaves the shortcuts alone; with those, 灵犀 is left
+alone and the models are synced the next time it happens to run with the port.
 
 The debug port is needed **for syncing only**. The local proxy keeps working
 without it, and `launch-lingxi.cmd` reopens 灵犀 with the port whenever you want
@@ -83,7 +89,8 @@ off or removed, or when the magpie gateway has been unreachable for 10 minutes.
 
 - Data dir: `%USERPROFILE%\.config\magpie\lingxi-agent`
   (`daemon.log`, `host.log`, `heartbeat`, `daemon.lock`, `install.json`,
-  `installed/` marker).
+  `installed/` marker, `shortcuts.json` holding the original shortcut
+  arguments the plugin appended the debug port to).
 - The proxy listens on `127.0.0.1:3426` (falls back to 3427-3435).
 - The plugin writes only 灵犀's `claw_custom_model_configs` and
   `cowork_model_option_v2` in its own storage.
@@ -102,10 +109,12 @@ off or removed, or when the magpie gateway has been unreachable for 10 minutes.
   same condition as a bare `ECONNREFUSED`, which reads like the magpie gateway
   is down even though it is not.
 - **灵犀 closed and reopened by itself**: that is the sync giving it the debug
-  port, and it happens once per change of model list. `daemon.log` says
-  `restarting Lingxi with --remote-debugging-port=9222 to sync (pid …)`. If it
-  says `Lingxi did not close`, a dialog or the tray icon held it; close it by
-  hand and the next daemon start syncs.
+  port, from a start entry the plugin could not write the argument to (the
+  public desktop shortcut needs admin rights). `daemon.log` says
+  `gave the debug port to … Lingxi shortcut(s)` and
+  `restarting Lingxi with --remote-debugging-port=9222 to sync (pid …)`. While
+  the log says `Lingxi stayed open after WM_CLOSE`, the tray icon held it and
+  it was ended to reopen with the port.
 - **Plugin is on but nothing ever syncs**: the plugin host only runs when magpie
   loads it, so switching the plugin on (or picking a model on the Agent page)
   does not by itself perform a sync while 灵犀 is already running without the

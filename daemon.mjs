@@ -44,9 +44,19 @@ const GATEWAY_DOWN_GRACE_MS = 10 * 60 * 1000
 // Lingxi itself when it has something to sync and the port is not there.
 const SYNCED = join(DATA, "synced.json")
 const RESTART_AT = join(DATA, "restart.json")
+const SHORTCUTS = join(DATA, "shortcuts.json")
+const SHORTCUT_OUT = join(DATA, "shortcuts-edit.json")
 const RESTART_COOLDOWN_MS = 5 * 60 * 1000
 const CDP_WAIT_MS = 20 * 1000
 const CLOSE_WAIT_MS = 8000
+const FORCE_CLOSE_WAIT_MS = 8000
+// The debug port can only be given at startup. Instead of asking the user to
+// remember launch-lingxi.cmd, the daemon adds the argument to every shortcut
+// that starts Lingxi (desktop, Start menu, taskbar, startup folder, Run key),
+// so a normal start always opens the port. A tray app that will not close on
+// WM_CLOSE is ended and reopened once; both can be turned off from the env.
+const NO_SHORTCUT = process.env.LINGXI_NO_SHORTCUT === "1"
+const FORCE_CLOSE = process.env.LINGXI_NO_FORCE_RESTART !== "1"
 
 let running = false
 let lastErrAt = 0
@@ -167,10 +177,11 @@ function powershellPath() {
   return candidates.find((p) => existsSync(p)) || "powershell.exe"
 }
 
-function psRun(script) {
+function psRun(script, env) {
   const encoded = Buffer.from(script, "utf16le").toString("base64")
   return spawnSync(powershellPath(), ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], {
-    encoding: "utf8", timeout: 15000, windowsHide: true,
+    encoding: "utf8", timeout: 30000, windowsHide: true,
+    env: env ? { ...process.env, ...env } : undefined,
   })
 }
 
@@ -189,8 +200,9 @@ async function lingxiPids(exe) {
 }
 
 // CloseMainWindow is a WM_CLOSE, not a kill: Lingxi gets to ask its questions
-// and to keep what the user is in the middle of. A window that stays open is
-// left alone rather than ended.
+// and to keep what the user is in the middle of. A tray app hides its window
+// instead of quitting, though, and the debug port can only be given at startup,
+// so a window that stays open is ended and reopened rather than left alone.
 async function closeLingxi(exe, pids) {
   psRun(`foreach ($id in @(${pids.join(",")})) { $p = Get-Process -Id $id -ErrorAction SilentlyContinue; if ($p) { [void]$p.CloseMainWindow() } }`)
   const until = Date.now() + CLOSE_WAIT_MS
@@ -198,7 +210,104 @@ async function closeLingxi(exe, pids) {
     if (!(await lingxiPids(exe)).length) return true
     await sleep(400)
   }
-  return (await lingxiPids(exe)).length === 0
+  if (!FORCE_CLOSE) return false
+  await log("Lingxi stayed open after WM_CLOSE; ending it to give it the debug port")
+  const name = String(exe).split(/[\\/]/).pop()
+  psRun(`taskkill /F /T /IM "${name}"`)
+  const until2 = Date.now() + FORCE_CLOSE_WAIT_MS
+  while (Date.now() < until2) {
+    if (!(await lingxiPids(exe)).length) return true
+    await sleep(300)
+  }
+  return false
+}
+
+// Adding the argument to the shortcuts is what makes a normal start open the
+// debug port, so the restart above happens at most once per start entry that
+// cannot be written (the public desktop needs admin rights). Backups of the
+// original arguments go to shortcuts.json so the change can be undone.
+const SHORTCUT_PS = `
+$ErrorActionPreference = 'SilentlyContinue'
+$exe = $env:LINGXI_EXE
+$add = ' --remote-debugging-port=' + $env:LINGXI_CDP
+if (-not $exe) { exit 0 }
+$changed = @()
+$backs = @()
+$sh = New-Object -ComObject WScript.Shell
+$roots = @(
+  [Environment]::GetFolderPath('Desktop'),
+  [Environment]::GetFolderPath('CommonDesktopDirectory'),
+  [Environment]::GetFolderPath('Programs'),
+  [Environment]::GetFolderPath('CommonPrograms'),
+  [Environment]::GetFolderPath('Startup'),
+  [Environment]::GetFolderPath('CommonStartup'),
+  (Join-Path $env:APPDATA 'Microsoft\\Internet Explorer\\Quick Launch\\User Pinned\\TaskBar')
+)
+foreach ($root in $roots) {
+  if (-not $root -or -not (Test-Path $root)) { continue }
+  Get-ChildItem $root -Recurse -Filter *.lnk -ErrorAction SilentlyContinue | ForEach-Object {
+    try {
+      $s = $sh.CreateShortcut($_.FullName)
+      if ($s.TargetPath -and ($s.TargetPath -ieq $exe) -and ([string]$s.Arguments -notmatch 'remote-debugging-port')) {
+        $backs += [pscustomobject]@{ kind = 'lnk'; path = $_.FullName; args = [string]$s.Arguments }
+        $s.Arguments = ([string]$s.Arguments).TrimEnd() + $add
+        $s.Save()
+        $changed += $_.FullName
+      }
+    } catch {}
+  }
+}
+foreach ($rk in @('HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run','HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run')) {
+  $key = Get-Item $rk -ErrorAction SilentlyContinue
+  if (-not $key) { continue }
+  foreach ($name in $key.GetValueNames()) {
+    $v = [string]$key.GetValue($name)
+    if ($v -and $v.IndexOf($exe, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and $v -notmatch 'remote-debugging-port') {
+      try {
+        $backs += [pscustomobject]@{ kind = 'run'; path = $rk; name = $name; value = $v }
+        Set-ItemProperty -Path $rk -Name $name -Value ($v.TrimEnd() + $add)
+        $changed += ($rk + ' :: ' + $name)
+      } catch {}
+    }
+  }
+}
+$obj = [pscustomobject]@{ changed = @($changed); backup = @($backs) }
+$json = ConvertTo-Json $obj -Compress -Depth 4
+[IO.File]::WriteAllText($env:LINGXI_SHORTCUT_OUT, $json, (New-Object Text.UTF8Encoding($false)))
+`
+
+function asList(x) {
+  return Array.isArray(x) ? x : x ? [x] : []
+}
+
+function readShortcutBackups() {
+  try {
+    const j = JSON.parse(readFileSync(SHORTCUTS, "utf8").replace(/^\uFEFF/, ""))
+    return Array.isArray(j) ? j : []
+  } catch { return [] }
+}
+
+async function giveShortcutsDebugPort(exe) {
+  if (NO_SHORTCUT || !exe) return
+  try {
+    psRun(SHORTCUT_PS, { LINGXI_EXE: exe, LINGXI_CDP: String(CDP_PORT), LINGXI_SHORTCUT_OUT: SHORTCUT_OUT })
+    let j = null
+    try { j = JSON.parse(readFileSync(SHORTCUT_OUT, "utf8").replace(/^\uFEFF/, "")) } catch {}
+    try { unlinkSync(SHORTCUT_OUT) } catch {}
+    const changed = asList(j?.changed)
+    if (!changed.length) return
+    const known = readShortcutBackups()
+    const keyOf = (b) => [b.kind, b.path, b.name || ""].join("\n")
+    const have = new Set(known.map(keyOf))
+    for (const b of asList(j?.backup)) {
+      const k = keyOf(b)
+      if (!have.has(k)) { have.add(k); known.push(b) }
+    }
+    try { writeFileSync(SHORTCUTS, JSON.stringify(known, null, 2)) } catch {}
+    await log(`gave the debug port to ${changed.length} Lingxi shortcut(s): ${changed.join(" | ")}`)
+  } catch (e) {
+    await log("could not update Lingxi shortcuts: " + e.message)
+  }
 }
 
 function sleep(ms) {
@@ -560,11 +669,14 @@ log(`daemon started pid=${process.pid} host-heartbeat-age=${Math.round(heartbeat
 let lastExe = ""
 const found = ensureInstall()
 if (found) { lastExe = found; log(`lingxi at ${found}`) }
+giveShortcutsDebugPort(found).catch(() => {})
 startProxy().then((p) => { if (!p) log("proxy: no free port"); else syncOnce() })
 setInterval(syncOnce, INTERVAL_MS)
 setInterval(() => {
   const exe = ensureInstall()
   if (exe && exe !== lastExe) { lastExe = exe; log(`lingxi at ${exe}`) }
+  // a Lingxi update can rewrite its shortcuts without the argument
+  giveShortcutsDebugPort(exe).catch(() => {})
 }, 10 * 60 * 1000)
 setInterval(async () => {
   if (!(await pluginEnabled())) {

@@ -12,7 +12,7 @@ export const agent = {
   config: "~/.config/magpie/lingxi.json",
   format: "json",
   model: "model",
-  notice: "WPS 灵犀 的模型由插件同步进它自己的自定义模型。需要同步时用 launch-lingxi.cmd 启动灵犀（带 --remote-debugging-port=9222）。",
+  notice: "插件会自动把 magpie 的模型同步进灵犀的自定义模型，并在需要时自动重开一次灵犀来开启同步端口；之后正常启动即可。",
 }
 
 export function connect({ gateway, model }) {
