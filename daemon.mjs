@@ -5,7 +5,7 @@
 // main.js spawns this once; a lock keeps it single. It stops when the plugin
 // host has not written a heartbeat for a few minutes (plugin off/removed).
 import { createServer } from "node:http"
-import { spawnSync } from "node:child_process"
+import { spawn, spawnSync } from "node:child_process"
 import { readFile, appendFile } from "node:fs/promises"
 import { readFileSync, writeSync, writeFileSync, openSync, closeSync, unlinkSync, statSync, existsSync, mkdirSync } from "node:fs"
 import { homedir } from "node:os"
@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url"
 const HOME = homedir()
 const HERE = fileURLToPath(new URL(".", import.meta.url))
 const CONFIG = join(HOME, ".config", "magpie", "lingxi.json")
+const PLUGINS = join(HOME, ".config", "magpie", "plugins.json")
 const DATA = join(HOME, ".config", "magpie", "lingxi-agent")
 const MARKER = join(DATA, "installed")
 const INSTALL = join(DATA, "install.json")
@@ -28,12 +29,32 @@ const DEFAULT_KEY = "magpie"
 const PREFIX = "magpie/"
 const EXCLUDE = ["wps-lingxi/"]
 const INTERVAL_MS = 5000
-const HEARTBEAT_TIMEOUT_MS = 90 * 1000
+// The plugin host is short-lived: magpie loads it, runs it and recycles it, so a
+// stale heartbeat does not mean the plugin is off. Liveness comes from the
+// signals that do mean stop: the plugin turned off or removed in magpie, or the
+// magpie gateway gone for good. Staying alive matters beyond syncing: the
+// magpie/* entries in Lingxi point at this proxy, so a daemon that exits takes
+// the models with it.
+const PLUGIN_SPEC = "magpie-agent-lingxi"
+const GATEWAY_DOWN_GRACE_MS = 10 * 60 * 1000
+// Lingxi keeps its custom models in its renderer's localStorage, so the only
+// way to write them is CDP, and CDP only exists when Lingxi starts with the
+// debug port. magpie cannot pass that argument (a GUI app is reopened with no
+// arguments, internal/agent/apprestart_windows.go), so the daemon restarts
+// Lingxi itself when it has something to sync and the port is not there.
+const SYNCED = join(DATA, "synced.json")
+const RESTART_AT = join(DATA, "restart.json")
+const RESTART_COOLDOWN_MS = 5 * 60 * 1000
+const CDP_WAIT_MS = 20 * 1000
+const CLOSE_WAIT_MS = 8000
 
 let running = false
 let lastErrAt = 0
-let lastLogAt = 0
 let lastOkAt = 0
+let gatewayDownSince = 0
+let cdpError = ""
+let lastRestartAt = 0
+const logAt = new Map()
 let proxyPort = 0
 let upstreamBase = DEFAULT_GATEWAY.replace(/\/+$/, "").replace(/\/v1$/, "")
 let upstreamKey = DEFAULT_KEY
@@ -42,9 +63,9 @@ async function log(line) {
   try { await appendFile(LOG, `[${new Date().toISOString()}] ${line}\n`) } catch {}
 }
 
-function logThrottled(line) {
+function logThrottled(key, line) {
   const now = Date.now()
-  if (now - lastLogAt > 60_000) { lastLogAt = now; log(line) }
+  if (now - (logAt.get(key) || 0) > 60_000) { logAt.set(key, now); log(line) }
 }
 
 function acquireLock() {
@@ -82,6 +103,22 @@ function heartbeatAge() {
   try { return Date.now() - statSync(HEARTBEAT).mtimeMs } catch { return Infinity }
 }
 
+// `magpie plugin off <spec>` keeps the plugin installed and only records
+// `off: true` in plugins.json, so read the switch instead of inferring it from
+// the heartbeat (which is stale whenever magpie simply is not calling the host).
+async function pluginEnabled() {
+  try {
+    const j = JSON.parse(await readFile(PLUGINS, "utf8"))
+    const list = Array.isArray(j?.plugins) ? j.plugins : null
+    if (!list) return true
+    const mine = list.filter((p) => typeof p?.spec === "string" && p.spec.includes(PLUGIN_SPEC))
+    if (!mine.length) return false
+    return !mine.some((p) => p.off === true)
+  } catch {
+    return true
+  }
+}
+
 // Find WPS Lingxi and leave a marker the agent plugin's `dir` points at, so the
 // agent is detected wherever the user installed it.
 function detectExe() {
@@ -117,6 +154,105 @@ function ensureInstall() {
     writeFileSync(INSTALL, JSON.stringify({ exe, dir: dirname(exe), detectedAt: new Date().toISOString() }, null, 2))
   } catch {}
   return exe
+}
+
+// Windows helpers. PowerShell is run with -EncodedCommand so the app's path
+// (which holds non-ASCII) never goes through a command line's code page.
+function powershellPath() {
+  const root = process.env.SystemRoot || process.env.windir || "C:\\Windows"
+  const candidates = [
+    join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+    join(root, "SysWOW64", "WindowsPowerShell", "v1.0", "powershell.exe"),
+  ]
+  return candidates.find((p) => existsSync(p)) || "powershell.exe"
+}
+
+function psRun(script) {
+  const encoded = Buffer.from(script, "utf16le").toString("base64")
+  return spawnSync(powershellPath(), ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], {
+    encoding: "utf8", timeout: 15000, windowsHide: true,
+  })
+}
+
+function lingxiExe() {
+  try {
+    const j = JSON.parse(readFileSync(INSTALL, "utf8"))
+    if (j.exe && existsSync(j.exe)) return j.exe
+  } catch {}
+  return ensureInstall()
+}
+
+async function lingxiPids(exe) {
+  const quoted = String(exe).replace(/'/g, "''")
+  const r = psRun(`Get-Process -ErrorAction SilentlyContinue | Where-Object { try { $_.Path -eq '${quoted}' } catch { $false } } | ForEach-Object { [string]$_.Id }`)
+  return (r.stdout || "").split(/\r?\n/).map((s) => s.trim()).filter((s) => /^\d+$/.test(s)).map(Number)
+}
+
+// CloseMainWindow is a WM_CLOSE, not a kill: Lingxi gets to ask its questions
+// and to keep what the user is in the middle of. A window that stays open is
+// left alone rather than ended.
+async function closeLingxi(exe, pids) {
+  psRun(`foreach ($id in @(${pids.join(",")})) { $p = Get-Process -Id $id -ErrorAction SilentlyContinue; if ($p) { [void]$p.CloseMainWindow() } }`)
+  const until = Date.now() + CLOSE_WAIT_MS
+  while (Date.now() < until) {
+    if (!(await lingxiPids(exe)).length) return true
+    await sleep(400)
+  }
+  return (await lingxiPids(exe)).length === 0
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms))
+}
+
+function readSynced() {
+  try { return JSON.parse(readFileSync(SYNCED, "utf8")) } catch { return {} }
+}
+
+function writeSynced(hash) {
+  try { writeFileSync(SYNCED, JSON.stringify({ hash, at: new Date().toISOString() })) } catch {}
+}
+
+// A failed restart must not repeat on every magpie start, so the cooldown is
+// kept on disk as well as in memory.
+function lastRestartAge() {
+  let at = lastRestartAt
+  try { at = Math.max(at, Number(JSON.parse(readFileSync(RESTART_AT, "utf8")).at) || 0) } catch {}
+  return Date.now() - at
+}
+
+// Lingxi is running without the debug port but has models to receive: restart
+// it with the port, which is the only moment the argument can be given.
+async function restartLingxiWithCdp() {
+  if (process.env.LINGXI_NO_RESTART === "1") return false
+  if (lastRestartAge() < RESTART_COOLDOWN_MS) return false
+  const exe = lingxiExe()
+  if (!exe) return false
+  const pids = await lingxiPids(exe)
+  if (!pids.length) {
+    logThrottled("notrunning", "Lingxi is not running; its models are synced once it starts")
+    return false
+  }
+  lastRestartAt = Date.now()
+  try { writeFileSync(RESTART_AT, JSON.stringify({ at: lastRestartAt })) } catch {}
+  await log(`restarting Lingxi with --remote-debugging-port=${CDP_PORT} to sync (pid ${pids.join(",")})`)
+  if (!(await closeLingxi(exe, pids))) {
+    await log("Lingxi did not close (a dialog or a tray icon may be holding it); not forcing it, models stay unsynced")
+    return false
+  }
+  try {
+    spawn(exe, [`--remote-debugging-port=${CDP_PORT}`], { detached: true, stdio: "ignore", windowsHide: false }).unref()
+  } catch (e) {
+    await log("could not start Lingxi again: " + e.message)
+    return false
+  }
+  const until = Date.now() + CDP_WAIT_MS
+  while (Date.now() < until) {
+    if (await cdpPage()) { await log("Lingxi is up with the debug port"); return true }
+    await sleep(500)
+  }
+  await log(`Lingxi did not open the debug port within ${CDP_WAIT_MS / 1000}s`)
+  return false
 }
 
 async function readConfig() {
@@ -235,8 +371,16 @@ function startProxy() {
 
 // ── CDP ─────────────────────────────────────────────────────────────────────
 async function cdpPage() {
-  const r = await fetch(`http://127.0.0.1:${CDP_PORT}/json`, { signal: AbortSignal.timeout(1500) })
-  const list = await r.json()
+  cdpError = ""
+  let list
+  try {
+    const r = await fetch(`http://127.0.0.1:${CDP_PORT}/json`, { signal: AbortSignal.timeout(1500) })
+    if (!r.ok) throw new Error(`HTTP ${r.status}`)
+    list = await r.json()
+  } catch (e) {
+    cdpError = e.message
+    return null
+  }
   return (
     list.find((t) => t.type === "page" && /lingxi\.wps\.cn/.test(t.url || "")) ||
     list.find((t) => t.type === "page" && t.webSocketDebuggerUrl) ||
@@ -280,9 +424,17 @@ async function syncOnce() {
     const cfg = await readConfig()
     upstreamBase = upstreamOf(cfg.gateway)
     upstreamKey = cfg.key
-    const models = await magpieModels(cfg.gateway, cfg.key)
-    if (!models.length) { logThrottled("no magpie models to sync"); return }
-    if (!proxyPort) { logThrottled("proxy not listening yet"); return }
+    let models
+    try {
+      models = await magpieModels(cfg.gateway, cfg.key)
+      gatewayDownSince = 0
+    } catch (e) {
+      if (!gatewayDownSince) gatewayDownSince = Date.now()
+      logThrottled("gateway", `magpie gateway ${cfg.gateway} unreachable: ${e.message}`)
+      return
+    }
+    if (!models.length) { logThrottled("empty", "no magpie models to sync"); return }
+    if (!proxyPort) { logThrottled("proxy", "proxy not listening yet"); return }
 
     const endpoint = `http://127.0.0.1:${proxyPort}/v1`
     const entries = models.map((id) => ({
@@ -296,9 +448,21 @@ async function syncOnce() {
     }))
     const idByModel = new Map(models.map((id, i) => [id, entries[i].id]))
     const wantedSel = cfg.model && idByModel.has(cfg.model) ? "custom_model_" + idByModel.get(cfg.model) : ""
+    // What Lingxi should end up holding. Once it holds exactly this, a Lingxi
+    // that runs without the debug port needs nothing from us.
+    const hash = JSON.stringify({ models, sel: wantedSel, endpoint })
 
     const page = await cdpPage()
-    if (!page) { logThrottled("Lingxi is not running with --remote-debugging-port=" + CDP_PORT); return }
+    if (!page) {
+      const synced = readSynced()
+      if (synced.hash === hash) {
+        logThrottled("idle", "Lingxi is closed to CDP, and it already holds these models")
+        return
+      }
+      logThrottled("cdp", `Lingxi has no page on CDP port ${CDP_PORT} (${cdpError || "no matching target"})`)
+      await restartLingxiWithCdp()
+      return
+    }
 
     const cdp = new CDP(page.webSocketDebuggerUrl)
     await cdp.open()
@@ -341,6 +505,7 @@ async function syncOnce() {
     })()`
     const out = await cdp.send("Runtime.evaluate", { expression: expr, returnByValue: true })
     const val = out.result?.value || {}
+    writeSynced(hash)
     if (val.changed) {
       await log(`synced ${val.count} models, selected=${val.selected || "(none)"}`)
       await cdp.send("Runtime.evaluate", { expression: "setTimeout(() => location.reload(), 600); true", returnByValue: true }).catch(() => {})
@@ -391,7 +556,7 @@ if (!acquireLock()) {
 for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => { releaseLock(); process.exit(0) })
 process.on("exit", releaseLock)
 
-log(`daemon started pid=${process.pid}`)
+log(`daemon started pid=${process.pid} host-heartbeat-age=${Math.round(heartbeatAge() / 1000)}s`)
 let lastExe = ""
 const found = ensureInstall()
 if (found) { lastExe = found; log(`lingxi at ${found}`) }
@@ -402,8 +567,15 @@ setInterval(() => {
   if (exe && exe !== lastExe) { lastExe = exe; log(`lingxi at ${exe}`) }
 }, 10 * 60 * 1000)
 setInterval(async () => {
-  if (heartbeatAge() > HEARTBEAT_TIMEOUT_MS) {
-    log("no plugin heartbeat for a while, cleaning up and stopping")
+  if (!(await pluginEnabled())) {
+    log("plugin turned off or removed, cleaning up and stopping")
+    try { await cleanupLingxi() } catch (e) { await log("cleanup error: " + e.message) }
+    releaseLock()
+    process.exit(0)
+    return
+  }
+  if (gatewayDownSince && Date.now() - gatewayDownSince > GATEWAY_DOWN_GRACE_MS) {
+    log(`magpie gateway gone for ${Math.round((Date.now() - gatewayDownSince) / 60000)} min, cleaning up and stopping`)
     try { await cleanupLingxi() } catch (e) { await log("cleanup error: " + e.message) }
     releaseLock()
     process.exit(0)

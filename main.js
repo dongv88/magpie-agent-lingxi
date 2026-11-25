@@ -1,7 +1,7 @@
 // magpie plugin host entry. It is short-lived, so it only makes sure the
 // detached daemon is running and writes a heartbeat for it.
-import { spawnSync } from "node:child_process"
-import { readFileSync, writeFileSync, appendFileSync, mkdirSync } from "node:fs"
+import { spawn, spawnSync } from "node:child_process"
+import { readFileSync, writeFileSync, appendFileSync, mkdirSync, existsSync } from "node:fs"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { homedir } from "node:os"
@@ -35,8 +35,21 @@ function sleep(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
 }
 
+// magpie's plugin host does not always get System32\WindowsPowerShell on its
+// PATH; a bare "powershell.exe" then fails with ENOENT and no daemon ever
+// starts (host.log: `Executable not found in $PATH: "powershell.exe"`). Resolve
+// it by absolute path.
+function powershellPath() {
+  const root = process.env.SystemRoot || process.env.windir || "C:\\Windows"
+  const candidates = [
+    join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+    join(root, "SysWOW64", "WindowsPowerShell", "v1.0", "powershell.exe"),
+  ]
+  return candidates.find((p) => existsSync(p)) || "powershell.exe"
+}
+
 function spawnDaemon(extra) {
-  return spawnSync("powershell.exe", [
+  return spawnSync(powershellPath(), [
     "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
     "-File", SPAWN,
     "-Bun", process.execPath,
@@ -60,7 +73,22 @@ if (!daemonAlive()) {
   while (Date.now() < until && !daemonAlive()) sleep(120)
   if (!daemonAlive()) {
     const r2 = spawnDaemon(["-NoLauncher"])
-    note(`launcher did not start it, direct spawn status=${r2.status}`)
+    note(`launcher did not start it, spawn without launcher status=${r2.status}`)
+    const until2 = Date.now() + 3000
+    while (Date.now() < until2 && !daemonAlive()) sleep(120)
+  }
+  if (!daemonAlive()) {
+    // No usable powershell at all: let Bun run the daemon itself, detached, so
+    // it survives this host being recycled. This may flash a console window,
+    // which is still better than a plugin that never syncs.
+    try {
+      spawn(process.execPath, [DAEMON], { cwd: HERE, detached: true, stdio: "ignore", windowsHide: true }).unref()
+      note("started the daemon with bun directly")
+      const until3 = Date.now() + 3000
+      while (Date.now() < until3 && !daemonAlive()) sleep(120)
+    } catch (e) {
+      note(`bun spawn failed: ${e.message}`)
+    }
   }
 } else {
   note("daemon already running")
