@@ -100,6 +100,12 @@ off or removed, or when the magpie gateway has been unreachable for 10 minutes.
   magpie gateway is at `127.0.0.1:3425`.
 - **After a 灵犀 update**: the app may restart without the debug port; run
   `launch-lingxi.cmd` again.
+- **Nothing starts after a magpie restart**: `host.log` used to show
+  `spawn via wmi status=null err=Executable not found in $PATH: "powershell.exe"`
+  because the plugin host does not always get System32\WindowsPowerShell on its
+  PATH. The host resolves `powershell.exe` by absolute path now, and falls back
+  to starting the daemon with Bun itself (logged as
+  `started the daemon with bun directly`) when that is not possible either.
 - **A command window on every magpie start**: fixed in 0.1.1. The daemon used to
   be created by WMI as a console program, which got a visible console window
   for as long as it ran. It is now created through `spawn-daemon.vbs`
