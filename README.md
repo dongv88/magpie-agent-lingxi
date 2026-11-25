@@ -57,10 +57,17 @@ magpie plugin off C:\path\to\magpie-agent-lingxi
 magpie plugin on  C:\path\to\magpie-agent-lingxi
 ```
 
-Turning it off disconnects the agent. About 90 seconds after the plugin host
-stops, the daemon removes the `magpie/*` entries from 灵犀, restores the model
-灵犀 had before, and exits. Turning it on again requires reconnecting the agent
-(Agent page) or `magpie lingxi deepseek/deepseek-flash`.
+Turning it off disconnects the agent. The daemon notices the switch in
+`~/.config/magpie/plugins.json` within about 15 seconds, removes the `magpie/*`
+entries from 灵犀, restores the model 灵犀 had before, and exits. Turning it on
+again requires reconnecting the agent (Agent page) or
+`magpie lingxi deepseek/deepseek-flash`.
+
+The daemon stays up while magpie runs, not just for the moment the plugin host
+happens to be alive: the plugin host is recycled right after magpie loads it, and
+the `magpie/*` entries in 灵犀 point at this daemon's proxy, so a daemon that
+quits early takes the models with it. It exits on its own only when the plugin is
+off or removed, or when the magpie gateway has been unreachable for 10 minutes.
 
 ## Data and privacy
 
@@ -80,7 +87,15 @@ stops, the daemon removes the `magpie/*` entries from 灵犀, restores the model
 
 - **Agent missing**: restart magpie once; check that 灵犀 is installed.
 - **Models missing in 灵犀**: 灵犀 must run with `--remote-debugging-port=9222`
-  for a sync; check `daemon.log`.
+  for a sync; check `daemon.log`. Since 0.1.3 the log says so directly:
+  `Lingxi has no page on CDP port 9222 (...)`. Earlier versions reported the
+  same condition as a bare `ECONNREFUSED`, which reads like the magpie gateway
+  is down even though it is not.
+- **Plugin is on but nothing ever syncs**: the plugin host only runs when magpie
+  loads it, so switching the plugin on (or picking a model on the Agent page)
+  does not by itself perform a sync while 灵犀 is already running without the
+  debug port. Start 灵犀 with `launch-lingxi.cmd` first, then toggle the plugin
+  off/on (or `magpie lingxi <model>`) to give the daemon a chance to sync.
 - **Models show but fail**: check the proxy port in `daemon.log` and that the
   magpie gateway is at `127.0.0.1:3425`.
 - **After a 灵犀 update**: the app may restart without the debug port; run

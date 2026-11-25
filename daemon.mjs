@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url"
 const HOME = homedir()
 const HERE = fileURLToPath(new URL(".", import.meta.url))
 const CONFIG = join(HOME, ".config", "magpie", "lingxi.json")
+const PLUGINS = join(HOME, ".config", "magpie", "plugins.json")
 const DATA = join(HOME, ".config", "magpie", "lingxi-agent")
 const MARKER = join(DATA, "installed")
 const INSTALL = join(DATA, "install.json")
@@ -28,12 +29,21 @@ const DEFAULT_KEY = "magpie"
 const PREFIX = "magpie/"
 const EXCLUDE = ["wps-lingxi/"]
 const INTERVAL_MS = 5000
-const HEARTBEAT_TIMEOUT_MS = 90 * 1000
+// The plugin host is short-lived: magpie loads it, runs it and recycles it, so a
+// stale heartbeat does not mean the plugin is off. Liveness comes from the
+// signals that do mean stop: the plugin turned off or removed in magpie, or the
+// magpie gateway gone for good. Staying alive matters beyond syncing: the
+// magpie/* entries in Lingxi point at this proxy, so a daemon that exits takes
+// the models with it.
+const PLUGIN_SPEC = "magpie-agent-lingxi"
+const GATEWAY_DOWN_GRACE_MS = 10 * 60 * 1000
 
 let running = false
 let lastErrAt = 0
-let lastLogAt = 0
 let lastOkAt = 0
+let gatewayDownSince = 0
+let cdpError = ""
+const logAt = new Map()
 let proxyPort = 0
 let upstreamBase = DEFAULT_GATEWAY.replace(/\/+$/, "").replace(/\/v1$/, "")
 let upstreamKey = DEFAULT_KEY
@@ -42,9 +52,9 @@ async function log(line) {
   try { await appendFile(LOG, `[${new Date().toISOString()}] ${line}\n`) } catch {}
 }
 
-function logThrottled(line) {
+function logThrottled(key, line) {
   const now = Date.now()
-  if (now - lastLogAt > 60_000) { lastLogAt = now; log(line) }
+  if (now - (logAt.get(key) || 0) > 60_000) { logAt.set(key, now); log(line) }
 }
 
 function acquireLock() {
@@ -80,6 +90,22 @@ function releaseLock() {
 
 function heartbeatAge() {
   try { return Date.now() - statSync(HEARTBEAT).mtimeMs } catch { return Infinity }
+}
+
+// `magpie plugin off <spec>` keeps the plugin installed and only records
+// `off: true` in plugins.json, so read the switch instead of inferring it from
+// the heartbeat (which is stale whenever magpie simply is not calling the host).
+async function pluginEnabled() {
+  try {
+    const j = JSON.parse(await readFile(PLUGINS, "utf8"))
+    const list = Array.isArray(j?.plugins) ? j.plugins : null
+    if (!list) return true
+    const mine = list.filter((p) => typeof p?.spec === "string" && p.spec.includes(PLUGIN_SPEC))
+    if (!mine.length) return false
+    return !mine.some((p) => p.off === true)
+  } catch {
+    return true
+  }
 }
 
 // Find WPS Lingxi and leave a marker the agent plugin's `dir` points at, so the
@@ -235,8 +261,16 @@ function startProxy() {
 
 // ── CDP ─────────────────────────────────────────────────────────────────────
 async function cdpPage() {
-  const r = await fetch(`http://127.0.0.1:${CDP_PORT}/json`, { signal: AbortSignal.timeout(1500) })
-  const list = await r.json()
+  cdpError = ""
+  let list
+  try {
+    const r = await fetch(`http://127.0.0.1:${CDP_PORT}/json`, { signal: AbortSignal.timeout(1500) })
+    if (!r.ok) throw new Error(`HTTP ${r.status}`)
+    list = await r.json()
+  } catch (e) {
+    cdpError = e.message
+    return null
+  }
   return (
     list.find((t) => t.type === "page" && /lingxi\.wps\.cn/.test(t.url || "")) ||
     list.find((t) => t.type === "page" && t.webSocketDebuggerUrl) ||
@@ -280,9 +314,17 @@ async function syncOnce() {
     const cfg = await readConfig()
     upstreamBase = upstreamOf(cfg.gateway)
     upstreamKey = cfg.key
-    const models = await magpieModels(cfg.gateway, cfg.key)
-    if (!models.length) { logThrottled("no magpie models to sync"); return }
-    if (!proxyPort) { logThrottled("proxy not listening yet"); return }
+    let models
+    try {
+      models = await magpieModels(cfg.gateway, cfg.key)
+      gatewayDownSince = 0
+    } catch (e) {
+      if (!gatewayDownSince) gatewayDownSince = Date.now()
+      logThrottled("gateway", `magpie gateway ${cfg.gateway} unreachable: ${e.message}`)
+      return
+    }
+    if (!models.length) { logThrottled("empty", "no magpie models to sync"); return }
+    if (!proxyPort) { logThrottled("proxy", "proxy not listening yet"); return }
 
     const endpoint = `http://127.0.0.1:${proxyPort}/v1`
     const entries = models.map((id) => ({
@@ -298,7 +340,10 @@ async function syncOnce() {
     const wantedSel = cfg.model && idByModel.has(cfg.model) ? "custom_model_" + idByModel.get(cfg.model) : ""
 
     const page = await cdpPage()
-    if (!page) { logThrottled("Lingxi is not running with --remote-debugging-port=" + CDP_PORT); return }
+    if (!page) {
+      logThrottled("cdp", `Lingxi has no page on CDP port ${CDP_PORT} (${cdpError || "no matching target"}); models are not synced - start Lingxi with launch-lingxi.cmd`)
+      return
+    }
 
     const cdp = new CDP(page.webSocketDebuggerUrl)
     await cdp.open()
@@ -391,7 +436,7 @@ if (!acquireLock()) {
 for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => { releaseLock(); process.exit(0) })
 process.on("exit", releaseLock)
 
-log(`daemon started pid=${process.pid}`)
+log(`daemon started pid=${process.pid} host-heartbeat-age=${Math.round(heartbeatAge() / 1000)}s`)
 let lastExe = ""
 const found = ensureInstall()
 if (found) { lastExe = found; log(`lingxi at ${found}`) }
@@ -402,8 +447,15 @@ setInterval(() => {
   if (exe && exe !== lastExe) { lastExe = exe; log(`lingxi at ${exe}`) }
 }, 10 * 60 * 1000)
 setInterval(async () => {
-  if (heartbeatAge() > HEARTBEAT_TIMEOUT_MS) {
-    log("no plugin heartbeat for a while, cleaning up and stopping")
+  if (!(await pluginEnabled())) {
+    log("plugin turned off or removed, cleaning up and stopping")
+    try { await cleanupLingxi() } catch (e) { await log("cleanup error: " + e.message) }
+    releaseLock()
+    process.exit(0)
+    return
+  }
+  if (gatewayDownSince && Date.now() - gatewayDownSince > GATEWAY_DOWN_GRACE_MS) {
+    log(`magpie gateway gone for ${Math.round((Date.now() - gatewayDownSince) / 60000)} min, cleaning up and stopping`)
     try { await cleanupLingxi() } catch (e) { await log("cleanup error: " + e.message) }
     releaseLock()
     process.exit(0)
