@@ -1,5 +1,5 @@
-// OpenCode loads this entry; it adds nothing. main.js is magpie's entry and
-// loads bridge.js in the same host, which keeps the proxy and does the sync.
+// OpenCode loads this entry. It must not start the sync daemon; main.js is the
+// magpie provider host's entry and owns the proxy and the CDP sync.
 export default function LingxiOpenCodePlugin() {
   return {}
 }

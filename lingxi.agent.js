@@ -1,8 +1,7 @@
 // WPS Lingxi as a magpie agent.
 // Lingxi keeps its model list in its own storage, not in a config file, so this
-// agent only carries the chosen model to ~/.config/magpie/lingxi.json. The
-// models themselves are written from the plugin's page (Sync), which asks
-// before closing and reopening Lingxi once; the local proxy serves them after.
+// agent only carries the chosen model to ~/.config/magpie/lingxi.json; the
+// Bun side (main.js) reads it and syncs magpie's models into Lingxi over CDP.
 import { ICON } from "./icon-data.mjs"
 
 export const agent = {
@@ -13,7 +12,7 @@ export const agent = {
   config: "~/.config/magpie/lingxi.json",
   format: "json",
   model: "model",
-  notice: "在插件页「WPS 灵犀」点「同步」，才会把 magpie 的模型写进灵犀：会询问后关闭并重开灵犀一次（开一次调试端口，写完即关）。之后灵犀正常启动即可使用 magpie 的模型。",
+  notice: "插件会自动把 magpie 的模型同步进灵犀的自定义模型，并在需要时自动重开一次灵犀来开启同步端口；之后正常启动即可。",
 }
 
 export function connect({ gateway, model }) {
