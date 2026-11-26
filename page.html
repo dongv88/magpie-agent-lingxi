@@ -1,0 +1,114 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="color-scheme" content="light dark">
+<title>WPS 灵犀 · magpie</title>
+<style>
+  :root { font: 13px/1.6 system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; }
+  body { margin: 0; padding: 24px; max-width: 720px; color: CanvasText; background: Canvas; }
+  h1 { font-size: 17px; margin: 0 0 4px; }
+  p.lead { margin: 0 0 18px; color: GrayText; }
+  section { border: 1px solid color-mix(in srgb, CanvasText 14%, transparent); border-radius: 10px; padding: 14px 16px; margin: 12px 0; }
+  h2 { font-size: 13px; margin: 0 0 8px; font-weight: 600; }
+  button { font: inherit; padding: 6px 14px; border-radius: 8px; border: 1px solid color-mix(in srgb, CanvasText 25%, transparent); background: Canvas; color: inherit; cursor: pointer; }
+  button.primary { background: #2b7de9; border-color: #2b7de9; color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  label { display: flex; gap: 8px; align-items: center; margin: 6px 0; }
+  ul { margin: 6px 0 0; padding-left: 18px; }
+  code { font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+  .hint { color: GrayText; font-size: 12px; }
+  .ok { color: #1a7f37; }
+  .bad { color: #cf222e; }
+  #out { white-space: pre-wrap; margin-top: 10px; min-height: 1em; }
+</style>
+
+<h1>WPS 灵犀</h1>
+<p class="lead">把 magpie 的模型以 <code>magpie/&lt;模型&gt;</code> 放进灵犀的「自定义模型」，由本机 127.0.0.1 的代理转发给 magpie 网关。</p>
+
+<section>
+  <h2>状态</h2>
+  <div id="status">读取中…</div>
+</section>
+
+<section>
+  <h2>同步</h2>
+  <p class="hint">灵犀把自定义模型存在它自己的页面存储里，没有配置文件，所以写入需要一次带调试端口启动的灵犀。同步会：<br>
+    ① 询问并温和关闭灵犀（不会强杀，未保存的对话由灵犀自己询问）；<br>
+    ② 用带调试端口的方式启动一次灵犀，写入模型列表并刷新页面；<br>
+    ③ 关闭它，再按你平时的启动方式重新打开——调试端口随之关闭。</p>
+  <label><input type="checkbox" id="autoStart"> 重新打开灵犀时，使用灵犀「开机自启」的启动方式（否则用普通方式启动）</label>
+  <p><button class="primary" id="sync">同步 magpie 的模型到灵犀</button></p>
+  <div id="out"></div>
+</section>
+
+<section>
+  <h2>代理</h2>
+  <p class="hint">灵犀里的 <code>magpie/&lt;模型&gt;</code> 指向本机（127.0.0.1，首次同步后固定）。只要 magpie 在运行，灵犀即使被普通地启动（没有调试端口），选中的 magpie 模型也能正常对话；换模型不需要再同步，换模型列表才需要。</p>
+</section>
+
+<script type="module">
+  // The desktop window opens this page at the service itself (127.0.0.1);
+  // one served to a browser comes through magpie's route to that service.
+  const base = (() => {
+    const here = new URL(location.href)
+    const path = here.pathname.replace(/[^/]*$/, "")
+    return path.endsWith("/_magpie/service/") ? path : "/"
+  })()
+
+  const $ = (s) => document.querySelector(s)
+  const out = (msg, cls = "") => { const d = $("#out"); d.className = cls; d.textContent = msg }
+
+  async function get(p, ms = 8000) {
+    const r = await fetch(base + p, { cache: "no-store", signal: AbortSignal.timeout(ms) })
+    return r.json()
+  }
+  async function post(p, body) {
+    const r = await fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body || {}) })
+    return r.json()
+  }
+
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]))
+
+  async function refresh() {
+    const s = await get("status", 15000)
+    const bridge = s.bridge && s.bridge.up ? `<span class="ok">运行中</span>` : `<span class="bad">未运行</span>`
+    const st = s.sync || {}
+    let magpie = "未知"
+    let lingxi = "未知"
+    if (st.error) {
+      magpie = `<span class="bad">${esc(st.error)}</span>`
+    } else {
+      magpie = `magpie 现有 <b>${(st.models || []).length}</b> 个模型${(st.models || []).slice(0, 6).map((m) => `<br><code>${esc(m)}</code>`).join("")}${(st.models || []).length > 6 ? `<br>…` : ""}`
+      const lx = st.lingxi || {}
+      if (!lx.running) lingxi = "未运行"
+      else if (lx.cdp) lingxi = `运行中，灵犀内现有 <b>${(lx.models || []).length}</b> 个 magpie 模型，当前选择 <code>${esc(lx.selected || "—")}</code>`
+      else lingxi = "运行中（未开启调试端口，属正常）"
+    }
+    $("#status").innerHTML = `<ul>
+      <li>桥接（代理与同步）：${bridge}</li>
+      <li>${magpie}</li>
+      <li>灵犀：${lingxi}</li></ul>`
+    $("#autoStart").checked = !!(s.settings && s.settings.autoStart !== false)
+  }
+
+  $("#autoStart").addEventListener("change", async (e) => {
+    await post("settings", { autoStart: e.target.checked })
+  })
+
+  $("#sync").addEventListener("click", async () => {
+    if (!confirm("同步会先关闭灵犀一次（灵犀会询问保存），再用调试端口打开、写完后再按你的方式重新打开。继续？")) return
+    const b = $("#sync"); b.disabled = true
+    out("同步中，请稍候（关闭并重开灵犀约需 10–30 秒）…")
+    try {
+      const r = await post("sync")
+      if (r.ok) out(`完成：灵犀现有 ${r.value.count} 个 magpie 模型，当前选择 ${r.value.selected || "（未选择）"}。`, "ok")
+      else out("未完成：" + (r.why || "未知原因"), "bad")
+    } catch (e) {
+      out("未完成：" + e.message, "bad")
+    } finally {
+      b.disabled = false
+      refresh().catch(() => {})
+    }
+  })
+
+  refresh().catch((e) => { $("#status").textContent = "无法连接插件服务：" + e.message })
+</script>

@@ -1,107 +1,142 @@
-// magpie plugin host entry. It is short-lived, so it only makes sure the
-// detached daemon is running and writes a heartbeat for it.
-import { spawn, spawnSync } from "node:child_process"
-import { readFileSync, writeFileSync, appendFileSync, mkdirSync, existsSync } from "node:fs"
+// magpie's entry for this plugin: the Lingxi bridge, and the page that syncs.
+//
+// The bridge (bridge.js) is loaded here, in magpie's plugin host itself, so
+// the proxy and everything a sync runs live and die with the host: turning
+// the plugin off, updating it or quitting magpie ends all of it. The proxy is
+// what Lingxi's `magpie/<model>` entries call; bridge's sync writes the model
+// list into Lingxi when the user presses Sync on the plugin's page. Lingxi is
+// only ever closed by asking its windows to close, and only after that press.
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import { createServer } from "node:http"
 import { join } from "node:path"
-import { fileURLToPath } from "node:url"
+import { fileURLToPath, pathToFileURL } from "node:url"
 import { homedir } from "node:os"
 
 const HERE = fileURLToPath(new URL(".", import.meta.url))
 const DATA = join(homedir(), ".config", "magpie", "lingxi-agent")
-const HEARTBEAT = join(DATA, "heartbeat")
-const LOCK = join(DATA, "daemon.lock")
-const DAEMON = join(HERE, "daemon.mjs")
-const SPAWN = join(HERE, "spawn-daemon.ps1")
-const LAUNCHER = join(HERE, "spawn-daemon.vbs")
+const BRIDGE = join(HERE, "bridge.js")
+const PAGE = join(HERE, "page.html")
 const LOG = join(DATA, "host.log")
+// The page's service's port (page.html asks nothing else).
+const SERVICE_PORT = 3477
+
+try { mkdirSync(DATA, { recursive: true }) } catch {}
 
 function note(line) {
   try { appendFileSync(LOG, `[${new Date().toISOString()}] ${line}\n`) } catch {}
 }
 
-function heartbeat() {
-  try { writeFileSync(HEARTBEAT, String(Date.now())) } catch {}
-}
+// The bridge's own answers: {type, id} out, {type, id, ok, why, value} back.
+let bridge = null
+const waiting = new Map()
 
-function daemonAlive() {
-  try {
-    const pid = Number(readFileSync(LOCK, "utf8").trim())
-    if (!pid) return false
-    try { process.kill(pid, 0); return true } catch { return false }
-  } catch { return false }
-}
-
-function sleep(ms) {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
-}
-
-// magpie's plugin host does not always get System32\WindowsPowerShell on its
-// PATH; a bare "powershell.exe" then fails with ENOENT and no daemon ever
-// starts (host.log: `Executable not found in $PATH: "powershell.exe"`). Resolve
-// it by absolute path.
-function powershellPath() {
-  const root = process.env.SystemRoot || process.env.windir || "C:\\Windows"
-  const candidates = [
-    join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
-    join(root, "SysWOW64", "WindowsPowerShell", "v1.0", "powershell.exe"),
-  ]
-  return candidates.find((p) => existsSync(p)) || "powershell.exe"
-}
-
-function spawnDaemon(extra) {
-  return spawnSync(powershellPath(), [
-    "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-    "-File", SPAWN,
-    "-Bun", process.execPath,
-    "-Daemon", DAEMON,
-    "-WorkDir", HERE,
-    "-DataDir", DATA,
-    ...extra,
-  ], { timeout: 15000, stdio: "ignore", windowsHide: true })
-}
-
-try { mkdirSync(DATA, { recursive: true }) } catch {}
-heartbeat()
-if (!daemonAlive()) {
-  // WMI creates the process outside this host's job object, so it survives the
-  // host being recycled. spawn-daemon.ps1 starts it through wscript, so no
-  // console window is created.
-  const r = spawnDaemon(["-Launcher", LAUNCHER])
-  note(`spawn via wmi status=${r.status} err=${r.error ? r.error.message : ""}`)
-  // wscript returns at once; the daemon's lock file is what says it is up.
-  const until = Date.now() + 3000
-  while (Date.now() < until && !daemonAlive()) sleep(120)
-  if (!daemonAlive()) {
-    const r2 = spawnDaemon(["-NoLauncher"])
-    note(`launcher did not start it, spawn without launcher status=${r2.status}`)
-    const until2 = Date.now() + 3000
-    while (Date.now() < until2 && !daemonAlive()) sleep(120)
+async function theBridge() {
+  if (!bridge) {
+    bridge = await import(pathToFileURL(BRIDGE).href)
+    bridge.onMessage((m) => {
+      const done = m && waiting.get(`${m.type}:${m.id}`)
+      if (done) done({ ok: m.ok !== false, why: m.why || "", value: m.value || null })
+    })
+    note("bridge loaded")
   }
-  if (!daemonAlive()) {
-    // No usable powershell at all: let Bun run the daemon itself, detached, so
-    // it survives this host being recycled. This may flash a console window,
-    // which is still better than a plugin that never syncs.
-    try {
-      spawn(process.execPath, [DAEMON], { cwd: HERE, detached: true, stdio: "ignore", windowsHide: true }).unref()
-      note("started the daemon with bun directly")
-      const until3 = Date.now() + 3000
-      while (Date.now() < until3 && !daemonAlive()) sleep(120)
-    } catch (e) {
-      note(`bun spawn failed: ${e.message}`)
+  return bridge
+}
+
+async function ask(type, timeout) {
+  let b
+  try { b = await theBridge() } catch (e) { return { ok: false, why: String(e?.message || e) } }
+  const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  return new Promise((resolve) => {
+    const t = setTimeout(() => { waiting.delete(`${type}:${id}`); resolve({ ok: false, why: "the bridge didn't answer in time" }) }, timeout)
+    waiting.set(`${type}:${id}`, (r) => { clearTimeout(t); waiting.delete(`${type}:${id}`); resolve(r) })
+    try { b.answer(type, id) } catch (e) { clearTimeout(t); waiting.delete(`${type}:${id}`); resolve({ ok: false, why: String(e?.message || e) }) }
+  })
+}
+
+// Lingxi started at sign-in, again, after a sync put it back without the
+// debug port (a user's choice on the page).
+function settings() {
+  try { return { autoStart: true, ...JSON.parse(readFileSync(join(DATA, "settings.json"), "utf8")) } } catch { return { autoStart: true } }
+}
+
+function writeSettings(s) {
+  try { writeFileSync(join(DATA, "settings.json"), JSON.stringify(s, null, 2)) } catch {}
+}
+
+function readBody(req) {
+  return new Promise((resolve) => {
+    let s = ""
+    req.on("data", (c) => { s += c; if (s.length > 1 << 16) req.destroy() })
+    req.on("end", () => resolve(s))
+    req.on("error", () => resolve(""))
+  })
+}
+
+// ── the Sync page's service ─────────────────────────────────────────────────
+// The desktop window's page reaches this on 127.0.0.1 itself (a page served
+// to a browser goes through magpie's own route). It serves its page, which
+// has no other origin to load from, and what the page asks: what a sync would
+// write, a sync, the setting.
+function startService(port, preview) {
+  const origin = `http://127.0.0.1:${port}`
+  const server = createServer(async (req, res) => {
+    const url = new URL(req.url || "/", "http://127.0.0.1")
+    const reply = (code, v) => { res.writeHead(code, { "content-type": "application/json", "cache-control": "no-store" }); res.end(JSON.stringify(v)) }
+    // another site's page (a sandboxed one sends Origin: null) is no business here
+    const o = req.headers.origin
+    if (o && o !== "null" && o !== origin) { res.writeHead(403); res.end(); return }
+    const p = url.pathname
+    if (p === "/" || p === "/index.html") {
+      try {
+        res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" })
+        res.end(readFileSync(PAGE))
+      } catch {
+        res.writeHead(500, { "content-type": "text/plain; charset=utf-8" }); res.end("page.html is missing from this plugin")
+      }
+      return
     }
-  }
-} else {
-  note("daemon already running")
+    if (p === "/status") {
+      // what a sync would write, and how many magpie has to give
+      const left = await preview()
+      return reply(200, { bridge: { up: !!bridge }, settings: settings(), sync: left.ok ? left.value : { error: left.why } })
+    }
+    if (p === "/sync" && req.method === "POST") return reply(200, await ask("sync", 150000))
+    if (p === "/settings" && req.method === "POST") {
+      let j = {}
+      try { j = JSON.parse(await readBody(req)) } catch {}
+      const s = settings()
+      if (typeof j.autoStart === "boolean") s.autoStart = j.autoStart
+      writeSettings(s)
+      return reply(200, s)
+    }
+    res.writeHead(404); res.end()
+  })
+  return new Promise((resolve) => {
+    server.once("error", (e) => { note(`service on ${port}: ${e.message}`); resolve(null) })
+    server.listen(port, "127.0.0.1", () => { note(`service on ${origin}`); resolve(server) })
+  })
 }
 
-// A provider is what makes magpie's Bun host (and its CLI) consider this
-// plugin ready. It serves no models; the daemon does the work.
-export default function LingxiSyncPlugin() {
+// ── the plugin host's part ──────────────────────────────────────────────────
+// The page's `sync` ask. Every plugin loaded when the host starts gets one,
+// so the host stays up for it (host.js's run holds it) and the bridge, which
+// serves Lingxi's models, is there between magpie's own calls.
+function holdBySync() {
   return {
-    provider: {
-      id: "lingxi-sync",
-      name: "WPS 灵犀 同步",
-      async models() { return {} },
+    async sync() {
+      const r = await ask("sync", 150000)
+      return r.ok ? (r.value || {}) : { error: r.why || "the sync didn't finish" }
     },
   }
+}
+
+export default async function LingxiPlugin() {
+  // The bridge, in this host: it holds no timer of its own, so only a plugin
+  // that loads keeps the host (and with it the proxy) from ending. The page's
+  // service does hold one, started here and not before, so a host loading no
+  // plugin (a disabled one) ends what it found here rather than living on it.
+  await theBridge()
+  startService(SERVICE_PORT, () => ask("preview", 12000))
+  note("plugin loaded")
+  return holdBySync()
 }
